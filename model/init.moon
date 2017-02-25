@@ -1,13 +1,29 @@
-require 'cunn'
-require 'cudnn'
+require 'dpnn'
 
-import dofile from require 'moonscript'
-import thisfile from require 'paths'
+Model, parent = torch.class('Model', 'nn.Container')
 
-dofile(thisfile 'LookupTableW2V.moon')
-dofile(thisfile 'Model.moon')
+Model.__init = (opt) =>
+  parent.__init(self)
 
-init = (opts) -> Model
+  if opt.nGPU
+    require 'cunn'
+    require 'cudnn'
+
+  init = nil
+  if opt.model == 'model'
+    init = require('model.model')
+
+  return init(self, opt)
+
+Model.updateOutput = (input) =>
+  @output = @model\forward(input)
+  @output
+
+Model.updateGradInput = (input, gradOutput) =>
+  @gradInput = @model\backward(input, gradOutput)
+  @gradInput
+
+------------------------------------------------------------
 
 nn.Module.dontTrain = =>
   @parameters = =>
@@ -18,5 +34,3 @@ nn.Module.dontTrain = =>
 nn.Container.dontTrain = =>
   @applyToModules (mod) -> mod\dontTrain!
   nn.Module.dontTrain(self)
-
-{ :init }

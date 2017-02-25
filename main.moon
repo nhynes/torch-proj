@@ -1,76 +1,60 @@
 require 'torch'
 require 'cutorch'
-require 'drivers.CallbackQueue'
+require 'moonscript'
+posix = require 'posix'
 
-import dofile from require 'moonscript'
-import thisfile from require 'paths'
+require 'model.init'
+require 'dataloader'
+require 'drivers'
 
-git = dofile(thisfile 'gitdo.moon')
+opt = require('args')(arg)
 
-args = require 'args'
-opts = args.parse arg
+opt.nGPU = cutorch.getDeviceCount!
 
-if paths.filep opts.loadsnap
-  snapDesc = opts.loadsnap\split('_')
-  gitState = snapDesc[#snapDesc-1]
-  git.pushState(gitState)
+dataLoader = DataLoader(opt)
 
-model = require 'model.init'
-loader = require 'loader.init'
-drivers = require 'drivers.init'
-
-torch.setdefaulttensortype('torch.FloatTensor')
-cutorch.setDevice(opts.gpu+1)
-
-Model = model.init(opts)
-theModel = nil
-if paths.filep opts.loadsnap
-  print 'Loading model from '..opts.loadsnap
+model = nil
+if paths.filep opt.loadsnap
+  print 'Loading model from '..opt.loadsnap
   _ = require 'moses'
-  snap = torch.load(opts.loadsnap)
-  theModel = snap.model
+  snap = torch.load(opt.loadsnap)
+  model = snap.model
 
-  newOpts = _.pick opts,
-    'loadsnap', 'niters', 'dispfreq', 'valfreq', 'savefreq', 'lrG', 'lrD'
-  opts = _.extend(snap.opts, newOpts)
-  opts.savedState = snap.state
+  newopt = _.pick opt, 'loadsnap', 'epochs', 'dispfreq', 'savefreq', 'lr'
+  opt = _.extend(snap.opt, newopt)
+  opt.savedState = snap.state
 
-  torch.setRNGState(opts.savedState.randState[0])
+  torch.setRNGState(opt.savedState.randState[0])
 
-  print 'Resuming training from iteration '..opts.savedState.t
+  print 'Resuming training from iteration '..opt.savedState.t
 else
-  torch.manualSeed(opts.seed)
-  theModel = Model(opts)
+  torch.manualSeed(opt.seed)
+  model = Model(opt)
 
-cudnn.convert(theModel\cuda!, cudnn)
-theModel\apply (mod) ->
-  if torch.type(mod)\find('Convolution')
-    mod\setMode 'CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM',
-      'CUDNN_CONVOLUTION_BWD_DATA_ALGO_1', 'CUDNN_CONVOLUTION_BWD_FILTER_ALGO_1'
+if opt.nGPU > 1
+  model = with nn.DataParallelTable(1, true, true)
+    \add model
+    \threads -> require 'model.init'
 
-workers = loader.init(opts)
+model\cuda!
 
-train, val, snap = drivers.init(theModel, workers, opts)
+crit = with nn.ParallelCriterion!
+  \add nn.DistKLDivCriterion!
+  \add nn.DistKLDivCriterion!
+  \cuda!
 
-done = ->
-  workers\addjob (-> dataLoader\terminate!), ->
-  workers\terminate!
-  os.exit!
+drivers = Drivers(model, crit, dataLoader, opt)
 
--- set up callbacks
-cbq = with CallbackQueue(opts.startiter)
-  \add cb: done, iter: opts.niters > 0 and opts.niters or math.huge, priority: -math.huge
-  \add cb: val, interval: opts.valfreq, iter: opts.valfreq, priority: math.huge if opts.valfreq > 0
-  \add cb: snap, interval: opts.savefreq, iter: opts.savefreq if opts.savefreq > 0
+paths.mkdir('run')
+RUNFILE = 'run/'..opt.desc
+posix.mkfifo(RUNFILE)
+runfd = posix.open(RUNFILE, bit.bor(posix.O_RDONLY, posix.O_NONBLOCK))
 
-if paths.filep opts.loadsnap
-  git.popState!
+drivers\addHook 'iter', (drivers) ->
+  cmd = stringx.strip(posix.read(runfd, 100))
+  if cmd == 'snap'
+    drivers\snap(0)
 
 collectgarbage!
 
--- val!
-while #cbq > 0
-  train! for t=1,cbq\waitTime!
-  workers\synchronize!
-  cbq\advance!
-  cb! for cb in cbq\pull!
+drivers\run(t) for t=1,(opt.epochs > 0 and opt.epochs or math.huge)
